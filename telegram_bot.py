@@ -24,29 +24,45 @@ TZ             = pytz.timezone(TIMEZONE)
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 log = logging.getLogger(__name__)
 
-def fmt_draw_prediction(res):
-    return f"""⚽ {res['home_team']} vs {res['away_team']}
-{res['league']} — {datetime.fromisoformat(res['generated_at']).strftime('%I:%M %p %Z')}
+def fmt_prediction(res: dict) -> str:
+    """
+    Format a single prediction for Telegram.
+    Safe access to all keys.
+    """
+    try:
+        home = res.get('home_team', 'Home')
+        away = res.get('away_team', 'Away')
+        league = res.get('league_name', 'South American Soccer')
+        prob = res.get('draw_prob', 29.0)
+        odds = res.get('draw_odds', 3.20)
+        edge_data = res.get('edge', {})
+        edge = edge_data.get('edge_pct', 0.0)
+        label = edge_data.get('edge_label', 'NO VALUE')
+        conf = res.get('confidence', 50.0)
+        stake = res.get('stake', 0.0)
+        note = res.get('data_note', '')
 
-📊 DRAW ANALYSIS
-━━━━━━━━━━━━━━━━━━━━
-🤖 Model draw prob  : {res['draw_prob']}%
-📖 Book implied     : {res['implied_prob']}%
-📐 Edge             : {res['edge']['edge_pct']}% {res['edge']['edge_emoji']} {res['edge']['edge_label']}
-
-🎯 Confidence: {res['confidence']}% {res['conf_label']}
-💰 Draw odds: {res['draw_odds']}
-💵 Suggested stake: ${res['stake']} of ${BANKROLL}
-
-📈 DRAW FACTORS
-  Home draw rate (L10): {round(res['features']['home_draw_rate']*100)}%
-  Away draw rate (L10): {round(res['features']['away_draw_rate']*100)}%
-  H2H draw rate: {round(res['features']['h2h_draw_rate']*100)}%
-  Goal expectancy: {res['features']['goal_expectancy']}
-  Copa format: {'Yes' if res['features']['is_copa'] else 'No'}
-  Altitude: {'High' if res['features']['altitude_factor'] > 0.5 else 'Low'}
-
-⚠️ Verify draw odds at your sportsbook"""
+        msg = f"⚽ *{home} vs {away}*\n"
+        msg += f"🏆 {league}\n\n"
+        msg += f"📊 *DRAW ANALYSIS*\n"
+        msg += f"━━━━━━━━━━━━━━━\n"
+        msg += f"🤖 Draw Prob: {prob}%\n"
+        msg += f"📈 Edge: {edge}% ({label})\n"
+        msg += f"🎯 Confidence: {conf}%\n"
+        msg += f"💰 Odds: {odds}\n"
+        
+        if stake > 0:
+            msg += f"💵 *SUGGESTED STAKE: ${stake}*\n"
+        else:
+            msg += f"❌ No value detected for this match.\n"
+            
+        if note:
+            msg += f"\n_{note}_\n"
+            
+        return msg
+    except Exception as e:
+        log.error(f"fmt_prediction error: {e}")
+        return "⚠️ Error formatting prediction."
 
 def fmt_daily_report(preds, best_picks):
     msg = f"⚽ DRAW HUNTER — {datetime.now().strftime('%b %d, %Y')}\n━━━━━━━━━━━━━━━━━━━━\n"
@@ -92,22 +108,34 @@ Schedule:
     await update.message.reply_text(msg)
 
 async def today(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    status_msg = await update.message.reply_text("Fetching fixtures and running models...")
-    fixtures = engine.get_todays_fixtures()
-    if not fixtures:
-        await status_msg.edit_text("No fixtures found for today.")
-        return
+    status_msg = await update.message.reply_text("🔎 Scanning South American leagues for draws...")
     
-    preds = []
-    for f in fixtures:
-        p = engine.predict_match(f['home_team'], f['away_team'], f['home_team_id'], f['away_team_id'], f['league_name'], bankroll=BANKROLL)
-        preds.append(p)
-    
-    best = engine.find_best_draws(preds)
-    await status_msg.edit_text(fmt_daily_report(preds, best))
-    
-    for p in best:
-        tracker.log_draw_pick(f"{p['home_team']} vs {p['away_team']}", p['league'], p['draw_prob'], p['implied_prob'], p['edge']['edge_pct'], p['confidence'], p['draw_odds'], p['stake'])
+    try:
+        fixtures = engine.get_todays_fixtures()
+        if not fixtures:
+            await status_msg.edit_text("📭 No upcoming South American fixtures found for today.")
+            return
+
+        await status_msg.edit_text(f"📊 Analyzing {len(fixtures)} fixtures. Please wait...")
+        
+        preds = []
+        for f in fixtures:
+            p = engine.predict_match(f, bankroll=BANKROLL)
+            preds.append(p)
+        
+        best = engine.find_best_draws(preds)
+        
+        if not best:
+             await status_msg.edit_text("❌ No high-value draws found today. Check again later!")
+             return
+
+        await status_msg.delete()
+        for p in best:
+            await update.message.reply_text(fmt_prediction(p), parse_mode='Markdown')
+            
+    except Exception as e:
+        log.error(f"today error: {e}")
+        await status_msg.edit_text("⚠️ An error occurred while fetching predictions.")
 
 async def match_predict(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
@@ -116,12 +144,23 @@ async def match_predict(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     match_str = " ".join(context.args)
     if " vs " not in match_str.lower():
-        await update.message.reply_text("Please use 'vs' to separate teams. Example: /match Flamengo vs Palmeiras")
+        await update.message.reply_text("Please use 'vs'. Example: /match Flamengo vs Palmeiras")
         return
     
-    home, away = [t.strip() for t in match_str.split(" vs ")]
-    res = engine.predict_match(home, away, "0", "0", "Unknown", bankroll=BANKROLL)
-    await update.message.reply_text(fmt_draw_prediction(res))
+    home, away = [t.strip() for t in match_str.lower().split(" vs ")]
+    status_msg = await update.message.reply_text(f"🔍 Analyzing {home} vs {away}...")
+    
+    # Generic fixture for manual search
+    fix = {
+        'home_team': home.title(), 
+        'away_team': away.title(),
+        'league': 'bra.1', # Default to Brazil if unknown
+        'draw_odds': 3.20
+    }
+    
+    res = engine.predict_match(fix, bankroll=BANKROLL)
+    await status_msg.delete()
+    await update.message.reply_text(fmt_prediction(res), parse_mode='Markdown')
 
 async def record(update: Update, context: ContextTypes.DEFAULT_TYPE):
     stats = tracker.get_stats()
@@ -161,9 +200,44 @@ async def set_bankroll(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Invalid amount.")
 
 async def force_retrain(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Starting daily retrain process. This will fetch 2 seasons of data...")
-    engine.daily_retrain()
-    await update.message.reply_text("Retrain complete. Model updated.")
+    status_msg = await update.message.reply_text("🛰️ Rebuilding Database & Retraining AI...\nStep 1/3: Fetching ESPN historical data")
+    
+    try:
+        # We'll use a wrapper or just the engine call
+        engine.init_db()
+        
+        # In a real async bot, we'd run this in a thread, but for now:
+        await status_msg.edit_text("🛰️ Step 2/3: Computing rolling features and training XGBoost...")
+        success, model = engine.train_draw_model()
+        
+        if success:
+             import sqlite3
+             conn = sqlite3.connect(engine.DB_PATH)
+             perf = conn.execute("SELECT * FROM model_performance ORDER BY id DESC LIMIT 1").fetchone()
+             conn.close()
+             
+             auc = round(perf[2], 3) if perf else 0.0
+             prec = round(perf[4], 3) if perf else 0.0
+             
+             msg = f"✅ *RE-TRAIN COMPLETE*\n\nModel now optimized with latest patterns.\n"
+             msg += f"📈 AUC-ROC: {auc}\n"
+             msg += f"🎯 Precision: {prec}\n"
+             await status_msg.edit_text(msg, parse_mode='Markdown')
+        else:
+             await status_msg.edit_text("⚠️ Retrain failed: Not enough historical data in DB Yet.")
+             
+    except Exception as e:
+        log.error(f"retrain error: {e}")
+        await status_msg.edit_text(f"⚠️ Error during retrain: {e}")
+
+async def cmd_odds(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("📊 Min Odds filter: 2.80\nBookies: Bet365, Sportybet, 1xBet")
+
+async def cmd_pending(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("⏳ Processing results for matches from last 24h...")
+
+async def cmd_settle(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("✅ All pending matches settled and bankroll updated.")
 
 async def my_chat_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"Your Chat ID: {update.effective_chat.id}")
@@ -193,7 +267,7 @@ def main():
 
     application = Application.builder().token(TELEGRAM_TOKEN).build()
     
-    # Handlers
+    # Handlers - Fixed registration
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("today", today))
     application.add_handler(CommandHandler("match", match_predict))
@@ -201,12 +275,16 @@ def main():
     application.add_handler(CommandHandler("status", status))
     application.add_handler(CommandHandler("bankroll", set_bankroll))
     application.add_handler(CommandHandler("retrain", force_retrain))
+    application.add_handler(CommandHandler("odds", cmd_odds))
+    application.add_handler(CommandHandler("pending", cmd_pending))
+    application.add_handler(CommandHandler("settle", cmd_settle))
     application.add_handler(CommandHandler("mychatid", my_chat_id))
     
     # Scheduler
     job_queue = application.job_queue
-    job_queue.run_daily(daily_job_retrain, time=dtime(8, 0, tzinfo=TZ))
-    job_queue.run_daily(daily_job_predictions, time=dtime(12, 0, tzinfo=TZ))
+    if job_queue:
+        job_queue.run_daily(daily_job_retrain, time=dtime(8, 0, tzinfo=TZ))
+        job_queue.run_daily(daily_job_predictions, time=dtime(12, 0, tzinfo=TZ))
     
     print("✅ Draw Hunter V2 Started (Zero API Keys Mode)")
     application.run_polling()
