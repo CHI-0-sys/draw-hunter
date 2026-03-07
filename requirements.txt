@@ -1,0 +1,10 @@
+requests
+xgboost
+pandas
+numpy
+scipy
+scikit-learn
+joblib
+pytz
+python-telegram-bot[job-queue]
+python-dotenv
