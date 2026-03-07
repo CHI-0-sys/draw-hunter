@@ -107,14 +107,25 @@ def init_db():
     CREATE TABLE IF NOT EXISTS matches (
         match_id TEXT PRIMARY KEY, league TEXT, season TEXT, match_date TEXT,
         home_team TEXT, away_team TEXT, home_goals INTEGER, away_goals INTEGER,
-        result TEXT, is_draw INTEGER, total_goals INTEGER, draw_odds REAL
+        result TEXT, is_draw INTEGER, total_goals INTEGER, 
+        draw_odds REAL, home_odds REAL, away_odds REAL, source TEXT,
+        home_draw_rate REAL, away_draw_rate REAL,
+        home_goals_scored_avg REAL, away_goals_scored_avg REAL,
+        home_goals_conceded_avg REAL, away_goals_conceded_avg REAL,
+        home_win_rate REAL, away_win_rate REAL,
+        home_form_pts INTEGER, away_form_pts INTEGER,
+        home_last5_draws INTEGER, away_last5_draws INTEGER,
+        combined_draw_rate REAL, goal_expectancy REAL, defensive_strength REAL,
+        form_difference REAL, draw_rate_difference REAL,
+        h2h_draw_rate REAL, h2h_total_games INTEGER,
+        is_copa INTEGER, altitude_factor REAL, is_derby INTEGER, implied_draw_prob REAL
     )""")
 
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS fixtures (
-        fixture_id TEXT PRIMARY KEY, league TEXT, match_date TEXT,
-        home_team TEXT, away_team TEXT, home_id TEXT, away_id TEXT,
-        draw_odds REAL, status TEXT, prediction_json TEXT
+        fixture_id TEXT PRIMARY KEY, league TEXT, league_name TEXT, match_date TEXT,
+        home_team TEXT, away_team TEXT, home_team_id TEXT, away_team_id TEXT,
+        country TEXT, status TEXT, draw_odds REAL, prediction_json TEXT
     )""")
 
     cursor.execute("""
