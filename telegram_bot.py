@@ -109,22 +109,37 @@ def fmt_prediction(p: dict, index: int = 1) -> str:
             f"Odds: {p.get('draw_odds','?')}"
         )
 
-def fmt_daily_report(preds, best_picks):
-    msg = f"⚽ DRAW HUNTER — {datetime.now().strftime('%b %d, %Y')}\n━━━━━━━━━━━━━━━━━━━━\n"
-    msg += f"{len(preds)} matches analyzed\n{len(best_picks)} value draws found\n\n"
-    msg += "🔥 VALUE DRAWS TODAY:\n\n"
-    
-    for i, p in enumerate(best_picks[:5], 1):
-        msg += f"{i}. {p['home_team']} vs {p['away_team']}\n"
-        msg += f"   {p['league']}\n"
-        msg += f"   Draw: {p['draw_prob']}% | Edge: {p['edge']['edge_pct']}% | Conf: {p['confidence']}% {p['edge']['edge_emoji']}\n"
-        msg += f"   Odds: {p['draw_odds']} | Stake: ${p['stake']}\n\n"
-    
-    if best_picks:
+def fmt_daily_report(all_preds: list, value_picks: list) -> str:
+    """Format a summary report of today's predictions."""
+    now_str = datetime.now().strftime('%b %d, %Y')
+    msg = f"⚽ DRAW HUNTER — {now_str}\n━━━━━━━━━━━━━━━━━━━━\n"
+    msg += f"📊 Analyzed : {len(all_preds)} matches\n"
+    msg += f"🎯 Value picks found: {len(value_picks)}\n\n"
+
+    if not value_picks:
+        msg += "❌ No high-value draws found today.\n"
+    else:
+        msg += "🔥 *TOP VALUE DRAWS TODAY:*\n\n"
+        for i, p in enumerate(value_picks[:5], 1):
+            home = p.get('home_team', 'Home')
+            away = p.get('away_team', 'Away')
+            prob = p.get('draw_prob', 0)
+            edge = p.get('edge_pct', 0)
+            conf = p.get('confidence', 0)
+            odds = p.get('draw_odds', 0)
+            label = p.get('edge_label', '')
+            
+            msg += f"*{i}. {home} vs {away}*\n"
+            msg += f"   Draw: {prob}% | Edge: {edge:+.1f}% | Conf: {conf}%\n"
+            msg += f"   Odds: {odds} | {label}\n\n"
+
+        # Best pick highlight
+        best = value_picks[0]
         msg += "━━━━━━━━━━━━━━━━━━━━\n"
-        msg += f"🏆 BEST PICK: {best_picks[0]['home_team']} vs {best_picks[0]['away_team']} — DRAW\n"
-        msg += f"   Edge: {best_picks[0]['edge']['edge_pct']}% | Stake: ${best_picks[0]['stake']}\n"
-    msg += "━━━━━━━━━━━━━━━━━━━━\n⚠️ Always verify odds at Sportybet before betting"
+        msg += f"🏆 *BEST PICK:* {best.get('home_team')} vs {best.get('away_team')}\n"
+        msg += f"   Edge: {best.get('edge_pct', 0):+.1f}% | Stake: ${best.get('stake', 0)}\n"
+    
+    msg += "━━━━━━━━━━━━━━━━━━━━\n⚠️ Always verify odds before betting."
     return msg
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -195,7 +210,7 @@ async def cmd_today(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
         # Send summary
         await update.message.reply_text(
-            fmt_daily_report(value_draws, len(predictions)),
+            fmt_daily_report(predictions, value_draws),
             parse_mode='Markdown'
         )
 
@@ -526,7 +541,8 @@ async def job_daily_predictions(context: ContextTypes.DEFAULT_TYPE):
         preds.append(p)
     best = engine.find_best_draws(preds)
     if CHAT_ID:
-        await context.bot.send_message(chat_id=CHAT_ID, text=fmt_daily_report(preds, best))
+        report = fmt_daily_report(preds, best)
+        await context.bot.send_message(chat_id=CHAT_ID, text=report, parse_mode='Markdown')
 
 async def job_auto_settle(context: ContextTypes.DEFAULT_TYPE):
     # Placeholder for auto-settling logic
