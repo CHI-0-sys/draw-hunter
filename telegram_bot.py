@@ -1,5 +1,6 @@
 import os
 import logging
+import sqlite3
 import asyncio
 import pytz
 from datetime import datetime, time as dtime
@@ -266,7 +267,6 @@ async def cmd_record(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(tracker.format_stats_message(stats))
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    import sqlite3
     conn = sqlite3.connect(engine.DB_PATH)
     mp = conn.execute("SELECT * FROM model_performance ORDER BY id DESC LIMIT 1").fetchone()
     count = conn.execute("SELECT COUNT(*) FROM matches").fetchone()[0]
