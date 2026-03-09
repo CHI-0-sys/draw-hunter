@@ -266,24 +266,70 @@ async def cmd_record(update: Update, context: ContextTypes.DEFAULT_TYPE):
     stats = tracker.get_stats()
     await update.message.reply_text(tracker.format_stats_message(stats))
 
-async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    conn = sqlite3.connect(engine.DB_PATH)
-    mp = conn.execute("SELECT * FROM model_performance ORDER BY id DESC LIMIT 1").fetchone()
-    count = conn.execute("SELECT COUNT(*) FROM matches").fetchone()[0]
-    conn.close()
-    
-    if not mp:
-        await update.message.reply_text(f"Model not trained yet. Matches in DB: {count}")
-        return
-    
-    msg = f"""📊 DRAW HUNTER STATUS
-━━━━━━━━━━━━━━━━━━━━
-🎯 Matches in DB: {count}
-📈 Model AUC-ROC: {mp[2]}
-🎯 Draw Precision: {mp[4]}
-🔄 Last Retrain: {mp[1][:16]}
-━━━━━━━━━━━━━━━━━━━━"""
-    await update.message.reply_text(msg)
+async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    try:
+        conn    = sqlite3.connect(engine.DB_PATH)
+        total   = conn.execute("SELECT COUNT(*) FROM matches").fetchone()[0]
+        usable  = conn.execute(
+            "SELECT COUNT(*) FROM matches "
+            "WHERE combined_draw_rate IS NOT NULL AND combined_draw_rate > 0"
+        ).fetchone()[0]
+        dr      = conn.execute(
+            "SELECT AVG(is_draw) FROM matches WHERE combined_draw_rate > 0"
+        ).fetchone()[0] or 0.0
+        latest  = conn.execute(
+            "SELECT MAX(match_date) FROM matches"
+        ).fetchone()[0] or 'None'
+        th      = conn.execute(
+            "SELECT COUNT(*) FROM team_history"
+        ).fetchone()[0]
+        pending = conn.execute(
+            "SELECT COUNT(*) FROM prediction_log WHERE result='PENDING'"
+        ).fetchone()[0]
+        mp      = conn.execute(
+            "SELECT auc_roc, brier_score, samples, date "
+            "FROM model_performance ORDER BY date DESC LIMIT 1"
+        ).fetchone()
+
+        # Per-league breakdown
+        league_counts = conn.execute(
+            "SELECT league, COUNT(*) FROM matches GROUP BY league ORDER BY COUNT(*) DESC LIMIT 8"
+        ).fetchall()
+        conn.close()
+
+        import os
+        model_exists = os.path.exists(f'{engine.MODELS_DIR}/draw_model.pkl')
+        model_str = (
+            f"✅ Trained | AUC: {mp[0]:.3f} | "
+            f"Samples: {mp[2]} ({mp[3][:10]})"
+            if mp and model_exists else
+            "❌ Not trained yet — run /retrain"
+        )
+
+        league_str = "\n".join([
+            f"   {lc[0]}: {lc[1]} matches" for lc in league_counts
+        ]) or "   None"
+
+        await update.message.reply_text(
+            f"📊 *DRAW HUNTER STATUS*\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"📦 Total matches   : {total}\n"
+            f"✅ Usable (w/feats): {usable}\n"
+            f"📊 Draw rate       : {dr*100:.1f}%\n"
+            f"📅 Latest data     : {latest}\n"
+            f"👥 Team histories  : {th}\n"
+            f"⏳ Pending picks   : {pending}\n"
+            f"🤖 Model           : {model_str}\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"📋 *Matches by league:*\n{league_str}\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"🌍 Timezone : {TIMEZONE}\n"
+            f"💰 Bankroll : ${BANKROLL}\n"
+            f"🕐 Local    : {datetime.now(TZ).strftime('%I:%M %p %Z')}",
+            parse_mode='Markdown'
+        )
+    except Exception as e:
+        await update.message.reply_text(f"Status error: {e}")
 
 async def cmd_bankroll(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global BANKROLL
@@ -300,103 +346,144 @@ async def cmd_bankroll(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_retrain(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msg = await update.message.reply_text(
-        "🔄 *Retraining Draw Hunter...*\n"
-        "⏳ Step 1/3: Downloading Brazil CSV...",
+        "🔄 *Draw Hunter Retrain*\n"
+        "⏳ Step 1/4: Fixing DB schema...",
         parse_mode='Markdown'
     )
     try:
-        total_stored = 0
+        # Step 1: Schema
+        engine.init_db()
+        await msg.edit_text(
+            "🔄 *Draw Hunter Retrain*\n"
+            "✅ Step 1/4: DB schema ready\n"
+            "⏳ Step 2/4: Downloading CSVs...",
+            parse_mode='Markdown'
+        )
 
-        # Step 1: CSVs
-        for code, url in engine.CSV_SOURCES.items():
+        # Step 2: CSVs
+        csv_counts = {}
+        for code in engine.CSV_SOURCES:
             try:
                 df = engine.fetch_csv_training_data(code)
-                if not df.empty:
+                count = len(df) if hasattr(df, '__len__') else 0
+                if count > 0:
                     engine.store_csv_matches(df, code)
-                    total_stored += len(df)
-                    log.info(f"CSV {code}: {len(df)} rows stored")
+                    csv_counts[code] = count
+                    log.info(f"Stored {count} rows for {code}")
+                else:
+                    log.warning(f"No data returned for {code}")
+                    csv_counts[code] = 0
             except Exception as e:
-                log.error(f"CSV error {code}: {e}")
+                log.error(f"CSV {code} failed: {e}")
+                csv_counts[code] = 0
 
+        # Check DB after CSV import
         conn = sqlite3.connect(engine.DB_PATH)
-        total   = conn.execute("SELECT COUNT(*) FROM matches").fetchone()[0]
-        dr      = conn.execute("SELECT AVG(is_draw) FROM matches").fetchone()[0] or 0
+        total = conn.execute("SELECT COUNT(*) FROM matches").fetchone()[0]
+        usable = conn.execute(
+            "SELECT COUNT(*) FROM matches WHERE combined_draw_rate IS NOT NULL AND combined_draw_rate > 0"
+        ).fetchone()[0]
+        dr = conn.execute(
+            "SELECT AVG(is_draw) FROM matches WHERE combined_draw_rate > 0"
+        ).fetchone()[0] or 0.0
         conn.close()
 
+        # Build CSV summary line
+        csv_summary = " | ".join([
+            f"{code.upper()}: {n}" for code, n in csv_counts.items()
+        ]) or "No CSV data"
+
         await msg.edit_text(
-            f"🔄 *Retraining...*\n"
-            f"✅ Step 1/3: {total} matches loaded "
-            f"(draw rate: {dr*100:.1f}%)\n"
-            f"⏳ Step 2/3: Fetching ESPN team history...",
+            f"🔄 *Draw Hunter Retrain*\n"
+            f"✅ Step 1/4: DB schema ready\n"
+            f"✅ Step 2/4: {total} matches stored\n"
+            f"   {csv_summary}\n"
+            f"   Usable rows: {usable} | Draw rate: {dr*100:.1f}%\n"
+            f"⏳ Step 3/4: Fetching ESPN team history...",
             parse_mode='Markdown'
         )
 
-        # Step 2: ESPN team history for today's fixtures
-        fetched_teams = 0
+        # Step 3: ESPN history
+        fetched = 0
         try:
             fixtures = engine.get_todays_fixtures(TIMEZONE)
-            for f in fixtures[:12]:
+            fixture_count = len(fixtures) if fixtures else 0
+            for f in fixtures[:10]:
                 for tid, lcode in [
-                    (f['home_team_id'], f['league']),
-                    (f['away_team_id'], f['league'])
+                    (f.get('home_team_id',''), f.get('league','')),
+                    (f.get('away_team_id',''), f.get('league',''))
                 ]:
                     if tid and tid != '0':
-                        recs = engine.fetch_espn_team_history(tid, lcode, 15)
-                        if recs:
-                            engine.store_team_history(recs)
-                            fetched_teams += 1
-                    await asyncio.sleep(0.7)
+                        try:
+                            recs = engine.fetch_espn_team_history(tid, lcode, 15)
+                            if recs:
+                                engine.store_team_history(recs)
+                                fetched += 1
+                        except Exception:
+                            pass
+                    await asyncio.sleep(0.6)
         except Exception as e:
-            log.warning(f"ESPN history warning: {e}")
+            log.warning(f"ESPN step warning: {e}")
+            fixture_count = 0
 
         await msg.edit_text(
-            f"🔄 *Retraining...*\n"
-            f"✅ Step 1/3: {total} matches loaded\n"
-            f"✅ Step 2/3: {fetched_teams} team histories fetched\n"
-            f"⏳ Step 3/3: Training draw model...",
+            f"🔄 *Draw Hunter Retrain*\n"
+            f"✅ Step 1/4: DB schema ready\n"
+            f"✅ Step 2/4: {total} matches | {usable} usable\n"
+            f"✅ Step 3/4: {fetched} team histories fetched\n"
+            f"⏳ Step 4/4: Training draw model...",
             parse_mode='Markdown'
         )
 
-        # Step 3: Train model
+        # Step 4: Train
         model, _ = engine.train_draw_model()
 
         conn = sqlite3.connect(engine.DB_PATH)
-        mp   = conn.execute(
+        mp = conn.execute(
             "SELECT auc_roc, draw_precision, brier_score "
             "FROM model_performance ORDER BY date DESC LIMIT 1"
         ).fetchone()
-        th   = conn.execute("SELECT COUNT(*) FROM team_history").fetchone()[0]
+        th = conn.execute("SELECT COUNT(*) FROM team_history").fetchone()[0]
         conn.close()
 
         if model:
-            model_str = (
-                f"✅ Model trained\n"
-                f"   AUC: {mp[0]:.3f} | "
-                f"Precision: {mp[1]:.3f} | "
-                f"Brier: {mp[2]:.3f}"
-            ) if mp else "✅ Model trained"
+            if mp:
+                model_line = (
+                    f"✅ Model trained\n"
+                    f"   AUC: {mp[0]:.3f} | "
+                    f"Precision: {mp[1]:.3f}"
+                )
+            else:
+                model_line = "✅ Model trained"
         else:
-            model_str = (
-                f"⚠️ Need 200+ matches to train\n"
-                f"   Currently have {total} — "
-                f"{'almost there!' if total > 150 else 'fetching more...'}"
+            model_line = (
+                f"⚠️ Need 150+ usable rows\n"
+                f"   Have {usable} — "
+                + ("almost there!" if usable > 100 else
+                   "CSV download may have failed. Check /status")
             )
 
         await msg.edit_text(
-            f"✅ *Retrain Complete!*\n\n"
-            f"📦 Matches in DB     : {total}\n"
+            f"{'✅' if model else '⚠️'} *Retrain Complete*\n\n"
+            f"📦 Total matches     : {total}\n"
+            f"✅ Usable for model  : {usable}\n"
             f"📊 Draw rate         : {dr*100:.1f}%\n"
-            f"👥 Team histories    : {th} records\n"
-            f"🤖 {model_str}\n\n"
-            f"Run /today to get draw predictions.",
+            f"👥 Team histories    : {th}\n"
+            f"🤖 {model_line}\n\n"
+            + (
+                "Run /today to get predictions."
+                if model else
+                "⚠️ CSV download failed — check internet and run /retrain again.\n"
+                "Run /status to see DB details."
+            ),
             parse_mode='Markdown'
         )
 
     except Exception as e:
         log.error(f"Retrain error: {e}", exc_info=True)
         await msg.edit_text(
-            f"❌ Retrain error: {str(e)[:200]}\n\n"
-            f"Check internet connection and try again."
+            f"❌ Retrain error:\n`{str(e)[:300]}`",
+            parse_mode='Markdown'
         )
 
 async def cmd_odds(update: Update, context: ContextTypes.DEFAULT_TYPE):

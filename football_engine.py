@@ -1,4 +1,5 @@
 import requests
+import io
 import sqlite3
 import pandas as pd
 import numpy as np
@@ -45,6 +46,19 @@ ESPN_LEAGUES = {
 CSV_SOURCES = {
     'bra.1': 'https://www.football-data.co.uk/new/BRA.csv',
     'arg.1': 'https://www.football-data.co.uk/new/ARG.csv',
+    'usa.1':  'https://www.football-data.co.uk/new/USA.csv',
+}
+
+ALTITUDE_MAP = {
+    'bol.1': 1.0,   # High (La Paz)
+    'ecu.1': 0.8,   # High (Quito)
+    'col.1': 0.7,   # Med-High (Bogota)
+    'per.1': 0.6,   # Med (Cuzco/Puno)
+    'mex.1': 0.5,   # Med (CDMX)
+    'bra.1': 0.1,   # Low
+    'arg.1': 0.05,  # Low
+    'chi.1': 0.1,   # Low
+    'uru.1': 0.05,  # Low
 }
 
 FEATURE_COLUMNS = [
@@ -520,142 +534,223 @@ def build_features(home_team, away_team, league_code, country='', draw_odds=3.20
     }
 
 def fetch_csv_training_data(league_code: str) -> pd.DataFrame:
+    """
+    Download free CSV from football-data.co.uk.
+    Handles all column name variants and date formats.
+    """
     url = CSV_SOURCES.get(league_code)
-    if not url: return pd.DataFrame()
+    if not url:
+        log.warning(f"No CSV source for {league_code}")
+        return pd.DataFrame()
+
     try:
-        df = pd.read_csv(url)
+        log.info(f"Downloading: {url}")
+        r = requests.get(url, timeout=30,
+                         headers={'User-Agent': 'Mozilla/5.0'})
+        r.raise_for_status()
+
+        # Try multiple encodings
+        for enc in ['utf-8-sig', 'utf-8', 'latin-1', 'cp1252']:
+            try:
+                df = pd.read_csv(
+                    io.StringIO(r.content.decode(enc)),
+                    on_bad_lines='skip'
+                )
+                break
+            except Exception:
+                continue
+        else:
+            log.error(f"Could not decode CSV for {league_code}")
+            return pd.DataFrame()
+
+        # Strip whitespace from column names
+        df.columns = [c.strip() for c in df.columns]
+        log.info(f"CSV columns found: {list(df.columns)}")
+
+        # Normalize column names — map variants to standard names
+        col_map = {}
+        for c in df.columns:
+            cl = c.lower().strip()
+            if cl in ('date',):                          col_map[c] = 'Date'
+            elif cl in ('hometeam', 'home team', 'home'): col_map[c] = 'HomeTeam'
+            elif cl in ('awayteam', 'away team', 'away'): col_map[c] = 'AwayTeam'
+            elif cl in ('fthg', 'hg', 'home goals', 'homegoals'): col_map[c] = 'FTHG'
+            elif cl in ('ftag', 'ag', 'away goals', 'awaygoals'): col_map[c] = 'FTAG'
+            elif cl in ('ftr', 'res', 'result'):          col_map[c] = 'FTR'
+            elif cl in ('b365d', 'bbd', 'drawodds'):      col_map[c] = 'B365D'
+            elif cl in ('b365h',):                        col_map[c] = 'B365H'
+            elif cl in ('b365a',):                        col_map[c] = 'B365A'
+
+        df = df.rename(columns=col_map)
+
+        # Must have these columns
+        required = ['Date', 'HomeTeam', 'AwayTeam', 'FTHG', 'FTAG', 'FTR']
+        missing  = [c for c in required if c not in df.columns]
+        if missing:
+            log.error(f"CSV {league_code} missing columns: {missing}")
+            log.error(f"Available: {list(df.columns)}")
+            return pd.DataFrame()
+
+        # Filter completed matches
+        df = df[df['FTR'].isin(['H', 'D', 'A'])].copy()
+        df = df.dropna(subset=['Date', 'HomeTeam', 'AwayTeam'])
+        df = df[df['HomeTeam'].str.strip() != '']
+        df = df[df['AwayTeam'].str.strip() != '']
+
+        log.info(f"CSV {league_code}: {len(df)} valid rows after filtering")
         return df
+
     except Exception as e:
-        log.error(f"CSV Fetch Error {league_code}: {e}")
+        log.error(f"CSV download error {league_code}: {e}")
         return pd.DataFrame()
 
 def store_csv_matches(df: pd.DataFrame, league_code: str):
     """
-    Parse and store CSV matches with rolling features computed.
-    Features are computed from each team's prior history — no leakage.
+    Store CSV matches with rolling features.
+    Builds running team history from the CSV itself — no DB needed first.
     """
+    if df.empty:
+        log.warning(f"Empty dataframe for {league_code}")
+        return
+
     conn    = sqlite3.connect(DB_PATH)
-    stored  = 0
-    skipped = 0
+    stored  = skipped = 0
 
-    # Sort by date so rolling features are computed in order
-    df = df.copy()
-    try:
-        df['_parsed_date'] = pd.to_datetime(df['Date'], dayfirst=True, errors='coerce')
-        df = df.dropna(subset=['_parsed_date'])
-        df = df.sort_values('_parsed_date')
-    except Exception:
-        pass
+    # Running history cache — built as we go through sorted rows
+    team_cache = {}   # team_name -> list of {gf, ga, is_draw, win}
 
-    # Running history per team — built as we iterate
-    team_history_cache = {}
-
+    # Parse and sort by date first
+    rows_parsed = []
     for _, row in df.iterrows():
         try:
-            # Parse date
-            raw_date = str(row.get('Date', '')).strip()
-            try:
-                from datetime import datetime as _dt
-                parsed = _dt.strptime(raw_date, '%d/%m/%y')
-                match_date = parsed.strftime('%Y-%m-%d')
-            except Exception:
+            raw_date  = str(row.get('Date', '')).strip()
+            home_team = str(row.get('HomeTeam', '')).strip()
+            away_team = str(row.get('AwayTeam', '')).strip()
+            result    = str(row.get('FTR', '')).strip().upper()
+
+            if result not in ('H', 'D', 'A'):
+                continue
+            if not home_team or not away_team:
+                continue
+
+            # Parse date — handles DD/MM/YY and DD/MM/YYYY
+            match_date = None
+            for fmt in ('%d/%m/%y', '%d/%m/%Y', '%Y-%m-%d', '%m/%d/%Y'):
                 try:
-                    parsed = _dt.strptime(raw_date, '%d/%m/%Y')
-                    match_date = parsed.strftime('%Y-%m-%d')
+                    from datetime import datetime as _dt
+                    match_date = _dt.strptime(raw_date, fmt).strftime('%Y-%m-%d')
+                    break
                 except Exception:
-                    skipped += 1
                     continue
 
-            home_team  = str(row.get('HomeTeam', '')).strip()
-            away_team  = str(row.get('AwayTeam', '')).strip()
-            result_raw = str(row.get('FTR', '')).strip().upper()
-
-            if not home_team or not away_team:
-                skipped += 1
-                continue
-            if result_raw not in ('H', 'D', 'A'):
+            if not match_date:
                 skipped += 1
                 continue
 
-            home_goals = int(row.get('FTHG', 0) or 0)
-            away_goals = int(row.get('FTAG', 0) or 0)
-            is_draw    = 1 if result_raw == 'D' else 0
+            hg = int(float(row.get('FTHG', 0) or 0))
+            ag = int(float(row.get('FTAG', 0) or 0))
 
-            # Draw odds from Bet365 or average
             draw_odds = home_odds = away_odds = None
             try:
-                draw_odds = float(row.get('B365D') or row.get('BbAvD') or 0) or None
-                home_odds = float(row.get('B365H') or row.get('BbAvH') or 0) or None
-                away_odds = float(row.get('B365A') or row.get('BbAvA') or 0) or None
+                v = row.get('B365D')
+                draw_odds = float(v) if v and str(v).strip() not in ('', 'nan') else None
+                v = row.get('B365H')
+                home_odds = float(v) if v and str(v).strip() not in ('', 'nan') else None
+                v = row.get('B365A')
+                away_odds = float(v) if v and str(v).strip() not in ('', 'nan') else None
             except Exception:
                 pass
 
-            implied_draw_prob = round(1 / draw_odds, 4) if draw_odds and draw_odds > 1 else 0.30
+            rows_parsed.append({
+                'date': match_date, 'home': home_team, 'away': away_team,
+                'hg': hg, 'ag': ag, 'result': result,
+                'draw_odds': draw_odds, 'home_odds': home_odds,
+                'away_odds': away_odds,
+            })
+        except Exception as e:
+            log.warning(f"Row parse error: {e}")
+            skipped += 1
 
-            # ── Compute rolling features from running cache ───────────
-            def team_rolling(team, is_home_team):
-                hist = team_history_cache.get(team, [])
-                if not hist:
-                    return {
-                        'draw_rate': 0.29, 'goals_scored_avg': 1.2,
-                        'goals_conceded_avg': 1.1, 'win_rate': 0.33,
-                        'form_pts': 7, 'last5_draws': 1,
-                    }
-                recent = hist[-LOOKBACK:]
-                draws = wins = 0
-                gf_list = []
-                ga_list = []
-                form_pts = last5_draws = 0
-                for j, g in enumerate(reversed(recent)):
-                    gf_list.append(g['gf'])
-                    ga_list.append(g['ga'])
-                    if g['result'] == 'D':
-                        draws += 1
-                        if j < 5:
-                            form_pts    += 1
-                            last5_draws += 1
-                    elif g['win']:
-                        wins += 1
-                        if j < 5:
-                            form_pts += 3
-                n = max(len(recent), 1)
-                return {
-                    'draw_rate':           round(draws / n, 3),
-                    'goals_scored_avg':    round(np.mean(gf_list), 2) if gf_list else 1.2,
-                    'goals_conceded_avg':  round(np.mean(ga_list), 2) if ga_list else 1.1,
-                    'win_rate':            round(wins / n, 3),
-                    'form_pts':            form_pts,
-                    'last5_draws':         last5_draws,
-                }
+    # Sort chronologically
+    rows_parsed.sort(key=lambda x: x['date'])
+    log.info(f"CSV {league_code}: {len(rows_parsed)} rows to store")
 
-            hf = team_rolling(home_team, True)
-            af = team_rolling(away_team, False)
+    def get_rolling(team):
+        """Compute rolling stats from cache."""
+        hist = team_cache.get(team, [])
+        if not hist:
+            return {
+                'draw_rate': 0.29, 'goals_scored_avg': 1.2,
+                'goals_conceded_avg': 1.1, 'win_rate': 0.33,
+                'form_pts': 7, 'last5_draws': 1,
+            }
+        recent = hist[-LOOKBACK:]
+        n = len(recent)
+        draws = wins = 0
+        gf_list = []
+        ga_list = []
+        form_pts = last5_draws = 0
 
-            # H2H draw rate from DB
-            h2h_dr, h2h_n = get_h2h_draw_rate(home_team, away_team)
+        for i, g in enumerate(reversed(recent)):
+            gf_list.append(g['gf'])
+            ga_list.append(g['ga'])
+            if g['is_draw']:
+                draws += 1
+                if i < 5:
+                    form_pts    += 1
+                    last5_draws += 1
+            elif g['win']:
+                wins += 1
+                if i < 5:
+                    form_pts += 3
 
-            # Context
-            is_copa    = 1 if 'libertadores' in league_code or 'sudamericana' in league_code else 0
-            altitude   = 0.1  # CSV leagues mostly low altitude
-            is_derby   = 0
-            derby_pairs = [
-                ('Flamengo','Fluminense'), ('Flamengo','Vasco'),
-                ('Boca','River'), ('Nacional','Peñarol'),
-                ('Colo-Colo','Universidad'),
-            ]
+        return {
+            'draw_rate':           round(draws / n, 3),
+            'goals_scored_avg':    round(float(np.mean(gf_list)), 2),
+            'goals_conceded_avg':  round(float(np.mean(ga_list)), 2),
+            'win_rate':            round(wins / n, 3),
+            'form_pts':            form_pts,
+            'last5_draws':         last5_draws,
+        }
+
+    # Derby detection
+    derby_pairs = [
+        ('Flamengo','Fluminense'), ('Flamengo','Vasco'),
+        ('Boca','River'), ('Nacional','Peñarol'),
+        ('Colo-Colo','Universidad'),
+        ('Arsenal','Chelsea'), ('Arsenal','Tottenham'),
+        ('Liverpool','Everton'), ('Manchester','Manchester'),
+        ('Milan','Inter'), ('Juventus','Torino'),
+        ('Barcelona','Espanyol'), ('Real Madrid','Atletico'),
+        ('Galatasaray','Fenerbahce'),
+    ]
+
+    for r in rows_parsed:
+        try:
+            hf = get_rolling(r['home'])
+            af = get_rolling(r['away'])
+
+            is_copa  = 1 if 'libertadores' in league_code or 'sudamericana' in league_code else 0
+            country  = ALTITUDE_MAP.get(league_code, None)
+            altitude = 0.1
+
+            is_derby = 0
             for t1, t2 in derby_pairs:
-                if (t1.lower() in home_team.lower() and t2.lower() in away_team.lower()) or \
-                   (t2.lower() in home_team.lower() and t1.lower() in away_team.lower()):
+                if ((t1.lower() in r['home'].lower() and t2.lower() in r['away'].lower()) or
+                    (t2.lower() in r['home'].lower() and t1.lower() in r['away'].lower())):
                     is_derby = 1
                     break
 
-            match_id = f"{league_code}_{match_date}_{home_team}_{away_team}"
-            match_id = match_id.replace(' ', '_')[:120]
+            implied = round(1 / r['draw_odds'], 4) if r['draw_odds'] and r['draw_odds'] > 1 else 0.30
+
+            mid = f"{league_code}_{r['date']}_{r['home']}_{r['away']}"
+            mid = mid.replace(' ', '_')[:120]
 
             conn.execute("""
                 INSERT OR REPLACE INTO matches (
-                    match_id, league, season, match_date, home_team, away_team,
-                    home_goals, away_goals, result, is_draw, total_goals,
+                    match_id, league, season, match_date,
+                    home_team, away_team, home_goals, away_goals,
+                    result, is_draw, total_goals,
                     draw_odds, home_odds, away_odds, source,
                     home_draw_rate, away_draw_rate,
                     home_goals_scored_avg, away_goals_scored_avg,
@@ -663,20 +758,22 @@ def store_csv_matches(df: pd.DataFrame, league_code: str):
                     home_win_rate, away_win_rate,
                     home_form_pts, away_form_pts,
                     home_last5_draws, away_last5_draws,
-                    combined_draw_rate, goal_expectancy, defensive_strength,
-                    form_difference, draw_rate_difference,
-                    h2h_draw_rate, h2h_total_games,
-                    is_copa, altitude_factor, is_derby, implied_draw_prob
+                    combined_draw_rate, goal_expectancy,
+                    defensive_strength, form_difference,
+                    draw_rate_difference, h2h_draw_rate,
+                    h2h_total_games, is_copa, altitude_factor,
+                    is_derby, implied_draw_prob
                 ) VALUES (
                     ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,
                     ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?
                 )
             """, (
-                match_id, league_code, match_date[:4],
-                match_date, home_team, away_team,
-                home_goals, away_goals, result_raw, is_draw,
-                home_goals + away_goals,
-                draw_odds, home_odds, away_odds, 'football-data.co.uk',
+                mid, league_code, r['date'][:4], r['date'],
+                r['home'], r['away'], r['hg'], r['ag'],
+                r['result'], 1 if r['result']=='D' else 0,
+                r['hg'] + r['ag'],
+                r['draw_odds'], r['home_odds'], r['away_odds'],
+                'football-data.co.uk',
                 hf['draw_rate'], af['draw_rate'],
                 hf['goals_scored_avg'], af['goals_scored_avg'],
                 hf['goals_conceded_avg'], af['goals_conceded_avg'],
@@ -688,32 +785,36 @@ def store_csv_matches(df: pd.DataFrame, league_code: str):
                 round((hf['goals_conceded_avg'] + af['goals_conceded_avg']) / 2, 2),
                 hf['form_pts'] - af['form_pts'],
                 round(abs(hf['draw_rate'] - af['draw_rate']), 3),
-                h2h_dr, h2h_n,
-                is_copa, altitude, is_derby, implied_draw_prob
+                0.29, 0,   # h2h defaults — computed at predict time
+                is_copa, altitude, is_derby, implied
             ))
-            stored += 1
 
-            # Update running cache AFTER storing (no leakage)
+            # Update running cache AFTER insert — no data leakage
             for team, gf, ga, home_flag in [
-                (home_team, home_goals, away_goals, True),
-                (away_team, away_goals, home_goals, False),
+                (r['home'], r['hg'], r['ag'], True),
+                (r['away'], r['ag'], r['hg'], False),
             ]:
-                if team not in team_history_cache:
-                    team_history_cache[team] = []
-                win = (result_raw == 'H' and home_flag) or (result_raw == 'A' and not home_flag)
-                team_history_cache[team].append({
+                win = (r['result']=='H' and home_flag) or (r['result']=='A' and not home_flag)
+                if team not in team_cache:
+                    team_cache[team] = []
+                team_cache[team].append({
                     'gf': gf, 'ga': ga,
-                    'result': result_raw if result_raw == 'D' else ('W' if win else 'L'),
+                    'is_draw': r['result']=='D',
                     'win': win,
                 })
 
+            stored += 1
+            if stored % 200 == 0:
+                conn.commit()
+                log.info(f"  {league_code}: stored {stored} so far...")
+
         except Exception as e:
-            log.warning(f"CSV row error: {e}")
+            log.warning(f"Store row error: {e}")
             skipped += 1
 
     conn.commit()
     conn.close()
-    log.info(f"CSV {league_code}: stored {stored}, skipped {skipped}")
+    log.info(f"CSV {league_code}: ✅ stored={stored} skipped={skipped}")
 
 def predict_draw_prob(features: dict) -> tuple:
     """
