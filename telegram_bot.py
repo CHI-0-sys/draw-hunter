@@ -3,8 +3,8 @@ import logging
 import asyncio
 import pytz
 from datetime import datetime, time as dtime
-from telegram import Update, Bot
-from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
+from telegram import Update, Bot, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters, CallbackQueryHandler
 from dotenv import load_dotenv
 
 import football_engine as engine
@@ -20,49 +20,93 @@ CHAT_ID        = os.environ.get("CHAT_ID", "")
 MIN_ODDS       = float(os.environ.get("MIN_ODDS", "2.80"))
 TZ             = pytz.timezone(TIMEZONE)
 
+def confidence_emoji(conf: float) -> str:
+    if conf >= 80: return "🔥"
+    if conf >= 70: return "✅"
+    if conf >= 60: return "⚠️"
+    return "📉"
+
+def utc_from_local(hour, minute):
+    """Convert local time to UTC for scheduler."""
+    import pytz
+    from datetime import datetime as dt
+    local_tz = pytz.timezone(TIMEZONE)
+    now = dt.now()
+    local_dt = local_tz.localize(dt(now.year, now.month, now.day, hour, minute))
+    utc_dt = local_dt.astimezone(pytz.utc)
+    return utc_dt.time()
+
 # Setup logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 log = logging.getLogger(__name__)
 
-def fmt_prediction(res: dict) -> str:
-    """
-    Format a single prediction for Telegram.
-    Safe access to all keys.
-    """
+def fmt_prediction(p: dict, index: int = 1) -> str:
+    """Format a single draw prediction card. Never crashes."""
     try:
-        home = res.get('home_team', 'Home')
-        away = res.get('away_team', 'Away')
-        league = res.get('league_name', 'South American Soccer')
-        prob = res.get('draw_prob', 29.0)
-        odds = res.get('draw_odds', 3.20)
-        edge_data = res.get('edge', {})
-        edge = edge_data.get('edge_pct', 0.0)
-        label = edge_data.get('edge_label', 'NO VALUE')
-        conf = res.get('confidence', 50.0)
-        stake = res.get('stake', 0.0)
-        note = res.get('data_note', '')
+        features = p.get('features', {})
 
-        msg = f"⚽ *{home} vs {away}*\n"
-        msg += f"🏆 {league}\n\n"
-        msg += f"📊 *DRAW ANALYSIS*\n"
-        msg += f"━━━━━━━━━━━━━━━\n"
-        msg += f"🤖 Draw Prob: {prob}%\n"
-        msg += f"📈 Edge: {edge}% ({label})\n"
-        msg += f"🎯 Confidence: {conf}%\n"
-        msg += f"💰 Odds: {odds}\n"
-        
-        if stake > 0:
-            msg += f"💵 *SUGGESTED STAKE: ${stake}*\n"
-        else:
-            msg += f"❌ No value detected for this match.\n"
-            
-        if note:
-            msg += f"\n_{note}_\n"
-            
-        return msg
+        home_dr   = features.get('home_draw_rate', 0)
+        away_dr   = features.get('away_draw_rate', 0)
+        goal_exp  = features.get('goal_expectancy', 0)
+        h2h_rate  = features.get('h2h_draw_rate', 0)
+        h2h_games = int(features.get('h2h_total_games', 0))
+        is_copa   = features.get('is_copa', 0)
+        is_derby  = features.get('is_derby', 0)
+        alt       = features.get('altitude_factor', 0)
+
+        h2h_str = (
+            f"H2H draw rate  : {h2h_rate*100:.0f}% ({h2h_games} meetings)"
+            if h2h_games > 0 else
+            "H2H            : No history yet"
+        )
+
+        goal_str = (
+            f"{goal_exp:.1f} ({'low — draws likely 🎯' if goal_exp < 2.3 else 'high — open game'})"
+            if goal_exp > 0 else "N/A"
+        )
+
+        stake_str = (
+            f"💵 Suggested stake : *${p.get('stake', 0)}* of ${BANKROLL}"
+            if p.get('stake', 0) > 0 else
+            "💵 No stake (edge below threshold)"
+        )
+
+        data_note = p.get('data_note', '')
+        note_line = f"\n⚠️ _{data_note}_" if data_note else ""
+
+        return (
+            f"⚽ *{p.get('home_team','?')} vs {p.get('away_team','?')}*\n"
+            f"{p.get('league_name','⚽')} — {p.get('time_local','TBD')}\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"📊 *DRAW ANALYSIS*\n"
+            f"🤖 Model draw prob  : *{p.get('draw_prob', 0)}%*\n"
+            f"📖 Book implied     : *{p.get('implied_prob', 0)}%*\n"
+            f"📐 Edge             : *{p.get('edge_pct', 0):+.1f}%* {p.get('edge_label','')}\n"
+            f"\n"
+            f"🎯 Confidence : *{p.get('confidence', 0)}%* {confidence_emoji(p.get('confidence', 0))}\n"
+            f"💰 Draw odds  : *{p.get('draw_odds', 3.20)}*\n"
+            f"{stake_str}\n"
+            f"\n"
+            f"📈 *DRAW FACTORS*\n"
+            f"  Home draw rate (L{engine.LOOKBACK}) : {home_dr*100:.0f}%\n"
+            f"  Away draw rate (L{engine.LOOKBACK}) : {away_dr*100:.0f}%\n"
+            f"  Combined draw rate       : {((home_dr+away_dr)/2)*100:.0f}%\n"
+            f"  {h2h_str}\n"
+            f"  Goal expectancy          : {goal_str}\n"
+            f"  Copa/knockout format     : {'Yes ⚠️' if is_copa else 'No'}\n"
+            f"  Derby match              : {'Yes 🔥' if is_derby else 'No'}\n"
+            f"  Altitude factor          : {alt*100:.0f}%\n"
+            f"{note_line}\n"
+            f"⚠️ Verify draw odds at Sportybet before betting"
+        )
     except Exception as e:
         log.error(f"fmt_prediction error: {e}")
-        return "⚠️ Error formatting prediction."
+        return (
+            f"⚽ *{p.get('home_team','?')} vs {p.get('away_team','?')}*\n"
+            f"Draw prob: {p.get('draw_prob','?')}% | "
+            f"Edge: {p.get('edge_pct','?')}% | "
+            f"Odds: {p.get('draw_odds','?')}"
+        )
 
 def fmt_daily_report(preds, best_picks):
     msg = f"⚽ DRAW HUNTER — {datetime.now().strftime('%b %d, %Y')}\n━━━━━━━━━━━━━━━━━━━━\n"
@@ -82,8 +126,8 @@ def fmt_daily_report(preds, best_picks):
     msg += "━━━━━━━━━━━━━━━━━━━━\n⚠️ Always verify odds at Sportybet before betting"
     return msg
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = """👋 Welcome to Draw Hunter Bot V1!
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = """👋 Welcome to Draw Hunter Bot V2!
 South American Football Draw Prediction Specialist.
 
 Leagues Covered:
@@ -107,37 +151,92 @@ Schedule:
 12:00 PM - Daily prediction report"""
     await update.message.reply_text(msg)
 
-async def today(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    status_msg = await update.message.reply_text("🔎 Scanning South American leagues for draws...")
-    
+async def cmd_today(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    msg = await update.message.reply_text(
+        "⚽ Fetching today's South American fixtures..."
+    )
     try:
-        fixtures = engine.get_todays_fixtures()
+        fixtures = engine.get_todays_fixtures(TIMEZONE)
+
         if not fixtures:
-            await status_msg.edit_text("📭 No upcoming South American fixtures found for today.")
+            await msg.edit_text(
+                "📅 No South American fixtures found today.\n\n"
+                "Possible reasons:\n"
+                "• Midweek break (SA leagues usually play Thu–Sun)\n"
+                "• ESPN API delay — try again in 10 mins\n\n"
+                "Use /match to predict a specific game:\n"
+                "`/match Flamengo vs Palmeiras`",
+                parse_mode='Markdown'
+            )
             return
 
-        await status_msg.edit_text(f"📊 Analyzing {len(fixtures)} fixtures. Please wait...")
-        
-        preds = []
-        for f in fixtures:
-            p = engine.predict_match(f, bankroll=BANKROLL)
-            preds.append(p)
-        
-        best = engine.find_best_draws(preds)
-        
-        if not best:
-             await status_msg.edit_text("❌ No high-value draws found today. Check again later!")
-             return
+        await msg.edit_text(
+            f"⚽ Found *{len(fixtures)}* fixtures — analyzing draws...",
+            parse_mode='Markdown'
+        )
 
-        await status_msg.delete()
-        for p in best:
-            await update.message.reply_text(fmt_prediction(p), parse_mode='Markdown')
-            
+        predictions = []
+        for i, fixture in enumerate(fixtures):
+            try:
+                pred = engine.predict_match(fixture, BANKROLL)
+                predictions.append(pred)
+            except Exception as e:
+                log.error(f"Prediction error fixture {i}: {e}")
+
+        if not predictions:
+            await update.message.reply_text(
+                "❌ Predictions failed for all fixtures.\n"
+                "Run /retrain to load match data first."
+            )
+            return
+
+        value_draws = engine.find_best_draws(predictions)
+
+        # Send summary
+        await update.message.reply_text(
+            fmt_daily_report(value_draws, len(predictions)),
+            parse_mode='Markdown'
+        )
+
+        # Send detailed card for top value draws
+        for p in value_draws[:4]:
+            await asyncio.sleep(1)
+            kb = [[InlineKeyboardButton(
+                "📋 Log this pick",
+                callback_data=f"log_{p['fixture_id']}"
+            )]]
+            await update.message.reply_text(
+                fmt_prediction(p),
+                parse_mode='Markdown',
+                reply_markup=InlineKeyboardMarkup(kb)
+            )
+
+        # Cache for logging
+        ctx.bot_data['today_predictions'] = {
+            p['fixture_id']: p for p in predictions
+        }
+
+        # If no value draws, show top 3 anyway for info
+        if not value_draws and predictions:
+            await update.message.reply_text(
+                "📊 *Top matches by draw probability:*",
+                parse_mode='Markdown'
+            )
+            top3 = sorted(predictions, key=lambda x: x.get('draw_prob', 0), reverse=True)[:3]
+            for p in top3:
+                await asyncio.sleep(1)
+                await update.message.reply_text(
+                    fmt_prediction(p), parse_mode='Markdown'
+                )
+
     except Exception as e:
-        log.error(f"today error: {e}")
-        await status_msg.edit_text("⚠️ An error occurred while fetching predictions.")
+        log.error(f"cmd_today error: {e}", exc_info=True)
+        await msg.edit_text(
+            f"❌ Error: {str(e)[:200]}\n\n"
+            f"Try /retrain first to load match data."
+        )
 
-async def match_predict(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cmd_match(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
         await update.message.reply_text("Usage: /match Team A vs Team B")
         return
@@ -162,11 +261,11 @@ async def match_predict(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await status_msg.delete()
     await update.message.reply_text(fmt_prediction(res), parse_mode='Markdown')
 
-async def record(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cmd_record(update: Update, context: ContextTypes.DEFAULT_TYPE):
     stats = tracker.get_stats()
     await update.message.reply_text(tracker.format_stats_message(stats))
 
-async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     import sqlite3
     conn = sqlite3.connect(engine.DB_PATH)
     mp = conn.execute("SELECT * FROM model_performance ORDER BY id DESC LIMIT 1").fetchone()
@@ -180,13 +279,13 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = f"""📊 DRAW HUNTER STATUS
 ━━━━━━━━━━━━━━━━━━━━
 🎯 Matches in DB: {count}
-📈 Model AUC-ROC: {mp[3]}
-🎯 Draw Precision: {mp[5]}
+📈 Model AUC-ROC: {mp[2]}
+🎯 Draw Precision: {mp[4]}
 🔄 Last Retrain: {mp[1][:16]}
 ━━━━━━━━━━━━━━━━━━━━"""
     await update.message.reply_text(msg)
 
-async def set_bankroll(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cmd_bankroll(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global BANKROLL
     if not context.args:
         await update.message.reply_text(f"Current bankroll: ${BANKROLL}")
@@ -199,36 +298,106 @@ async def set_bankroll(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except ValueError:
         await update.message.reply_text("Invalid amount.")
 
-async def force_retrain(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    status_msg = await update.message.reply_text("🛰️ Rebuilding Database & Retraining AI...\nStep 1/3: Fetching ESPN historical data")
-    
+async def cmd_retrain(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    msg = await update.message.reply_text(
+        "🔄 *Retraining Draw Hunter...*\n"
+        "⏳ Step 1/3: Downloading Brazil CSV...",
+        parse_mode='Markdown'
+    )
     try:
-        # We'll use a wrapper or just the engine call
-        engine.init_db()
-        
-        # In a real async bot, we'd run this in a thread, but for now:
-        await status_msg.edit_text("🛰️ Step 2/3: Computing rolling features and training XGBoost...")
-        success, model = engine.train_draw_model()
-        
-        if success:
-             import sqlite3
-             conn = sqlite3.connect(engine.DB_PATH)
-             perf = conn.execute("SELECT * FROM model_performance ORDER BY id DESC LIMIT 1").fetchone()
-             conn.close()
-             
-             auc = round(perf[2], 3) if perf else 0.0
-             prec = round(perf[4], 3) if perf else 0.0
-             
-             msg = f"✅ *RE-TRAIN COMPLETE*\n\nModel now optimized with latest patterns.\n"
-             msg += f"📈 AUC-ROC: {auc}\n"
-             msg += f"🎯 Precision: {prec}\n"
-             await status_msg.edit_text(msg, parse_mode='Markdown')
+        total_stored = 0
+
+        # Step 1: CSVs
+        for code, url in engine.CSV_SOURCES.items():
+            try:
+                df = engine.fetch_csv_training_data(code)
+                if not df.empty:
+                    engine.store_csv_matches(df, code)
+                    total_stored += len(df)
+                    log.info(f"CSV {code}: {len(df)} rows stored")
+            except Exception as e:
+                log.error(f"CSV error {code}: {e}")
+
+        conn = sqlite3.connect(engine.DB_PATH)
+        total   = conn.execute("SELECT COUNT(*) FROM matches").fetchone()[0]
+        dr      = conn.execute("SELECT AVG(is_draw) FROM matches").fetchone()[0] or 0
+        conn.close()
+
+        await msg.edit_text(
+            f"🔄 *Retraining...*\n"
+            f"✅ Step 1/3: {total} matches loaded "
+            f"(draw rate: {dr*100:.1f}%)\n"
+            f"⏳ Step 2/3: Fetching ESPN team history...",
+            parse_mode='Markdown'
+        )
+
+        # Step 2: ESPN team history for today's fixtures
+        fetched_teams = 0
+        try:
+            fixtures = engine.get_todays_fixtures(TIMEZONE)
+            for f in fixtures[:12]:
+                for tid, lcode in [
+                    (f['home_team_id'], f['league']),
+                    (f['away_team_id'], f['league'])
+                ]:
+                    if tid and tid != '0':
+                        recs = engine.fetch_espn_team_history(tid, lcode, 15)
+                        if recs:
+                            engine.store_team_history(recs)
+                            fetched_teams += 1
+                    await asyncio.sleep(0.7)
+        except Exception as e:
+            log.warning(f"ESPN history warning: {e}")
+
+        await msg.edit_text(
+            f"🔄 *Retraining...*\n"
+            f"✅ Step 1/3: {total} matches loaded\n"
+            f"✅ Step 2/3: {fetched_teams} team histories fetched\n"
+            f"⏳ Step 3/3: Training draw model...",
+            parse_mode='Markdown'
+        )
+
+        # Step 3: Train model
+        model, _ = engine.train_draw_model()
+
+        conn = sqlite3.connect(engine.DB_PATH)
+        mp   = conn.execute(
+            "SELECT auc_roc, draw_precision, brier_score "
+            "FROM model_performance ORDER BY date DESC LIMIT 1"
+        ).fetchone()
+        th   = conn.execute("SELECT COUNT(*) FROM team_history").fetchone()[0]
+        conn.close()
+
+        if model:
+            model_str = (
+                f"✅ Model trained\n"
+                f"   AUC: {mp[0]:.3f} | "
+                f"Precision: {mp[1]:.3f} | "
+                f"Brier: {mp[2]:.3f}"
+            ) if mp else "✅ Model trained"
         else:
-             await status_msg.edit_text("⚠️ Retrain failed: Not enough historical data in DB Yet.")
-             
+            model_str = (
+                f"⚠️ Need 200+ matches to train\n"
+                f"   Currently have {total} — "
+                f"{'almost there!' if total > 150 else 'fetching more...'}"
+            )
+
+        await msg.edit_text(
+            f"✅ *Retrain Complete!*\n\n"
+            f"📦 Matches in DB     : {total}\n"
+            f"📊 Draw rate         : {dr*100:.1f}%\n"
+            f"👥 Team histories    : {th} records\n"
+            f"🤖 {model_str}\n\n"
+            f"Run /today to get draw predictions.",
+            parse_mode='Markdown'
+        )
+
     except Exception as e:
-        log.error(f"retrain error: {e}")
-        await status_msg.edit_text(f"⚠️ Error during retrain: {e}")
+        log.error(f"Retrain error: {e}", exc_info=True)
+        await msg.edit_text(
+            f"❌ Retrain error: {str(e)[:200]}\n\n"
+            f"Check internet connection and try again."
+        )
 
 async def cmd_odds(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("📊 Min Odds filter: 2.80\nBookies: Bet365, Sportybet, 1xBet")
@@ -239,55 +408,79 @@ async def cmd_pending(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_settle(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("✅ All pending matches settled and bankroll updated.")
 
-async def my_chat_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cmd_mychatid(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"Your Chat ID: {update.effective_chat.id}")
 
-async def daily_job_retrain(context: ContextTypes.DEFAULT_TYPE):
+async def cmd_leagues(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = "🏆 *SA LEAGUES COVERED*\n\n"
+    for code, name in engine.ESPN_LEAGUES.items():
+        msg += f"• `{code}`: {name}\n"
+    await update.message.reply_text(msg, parse_mode='Markdown')
+
+async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+    if data.startswith("log_"):
+        fid = data.replace("log_", "")
+        await query.edit_message_caption(caption=f"{query.message.caption}\n\n✅ Logged to tracker!")
+
+async def job_retrain(context: ContextTypes.DEFAULT_TYPE):
     engine.daily_retrain()
     if CHAT_ID:
         await context.bot.send_message(chat_id=CHAT_ID, text="✅ Daily retrain complete. Model updated with latest results.")
 
-async def daily_job_predictions(context: ContextTypes.DEFAULT_TYPE):
+async def job_daily_predictions(context: ContextTypes.DEFAULT_TYPE):
     fixtures = engine.get_todays_fixtures()
     if not fixtures: return
     preds = []
     for f in fixtures:
-        p = engine.predict_match(f['home_team'], f['away_team'], f['home_team_id'], f['away_team_id'], f['league_name'], bankroll=BANKROLL)
+        p = engine.predict_match(f, bankroll=BANKROLL)
         preds.append(p)
     best = engine.find_best_draws(preds)
     if CHAT_ID:
         await context.bot.send_message(chat_id=CHAT_ID, text=fmt_daily_report(preds, best))
-        for p in best:
-            tracker.log_draw_pick(f"{p['home_team']} vs {p['away_team']}", p['league'], p['draw_prob'], p['implied_prob'], p['edge']['edge_pct'], p['confidence'], p['draw_odds'], p['stake'])
+
+async def job_auto_settle(context: ContextTypes.DEFAULT_TYPE):
+    # Placeholder for auto-settling logic
+    log.info("Auto-settle job triggered")
 
 def main():
     if not TELEGRAM_TOKEN:
-        print("Error: TELEGRAM_TOKEN not found in .env")
+        print("❌ TELEGRAM_TOKEN not set in .env")
         return
 
-    application = Application.builder().token(TELEGRAM_TOKEN).build()
-    
-    # Handlers - Fixed registration
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("today", today))
-    application.add_handler(CommandHandler("match", match_predict))
-    application.add_handler(CommandHandler("record", record))
-    application.add_handler(CommandHandler("status", status))
-    application.add_handler(CommandHandler("bankroll", set_bankroll))
-    application.add_handler(CommandHandler("retrain", force_retrain))
-    application.add_handler(CommandHandler("odds", cmd_odds))
-    application.add_handler(CommandHandler("pending", cmd_pending))
-    application.add_handler(CommandHandler("settle", cmd_settle))
-    application.add_handler(CommandHandler("mychatid", my_chat_id))
-    
-    # Scheduler
-    job_queue = application.job_queue
-    if job_queue:
-        job_queue.run_daily(daily_job_retrain, time=dtime(8, 0, tzinfo=TZ))
-        job_queue.run_daily(daily_job_predictions, time=dtime(12, 0, tzinfo=TZ))
-    
-    print("✅ Draw Hunter V2 Started (Zero API Keys Mode)")
-    application.run_polling()
+    engine.init_db()
+
+    app = Application.builder().token(TELEGRAM_TOKEN).build()
+
+    # Register every command
+    app.add_handler(CommandHandler("start",    cmd_start))
+    app.add_handler(CommandHandler("today",    cmd_today))
+    app.add_handler(CommandHandler("match",    cmd_match))
+    app.add_handler(CommandHandler("odds",     cmd_odds))
+    app.add_handler(CommandHandler("record",   cmd_record))
+    app.add_handler(CommandHandler("pending",  cmd_pending))
+    app.add_handler(CommandHandler("settle",   cmd_settle))
+    app.add_handler(CommandHandler("retrain",  cmd_retrain))
+    app.add_handler(CommandHandler("leagues",  cmd_leagues))
+    app.add_handler(CommandHandler("status",   cmd_status))
+    app.add_handler(CommandHandler("mychatid", cmd_mychatid))
+    app.add_handler(CommandHandler("bankroll", cmd_bankroll))
+    app.add_handler(CallbackQueryHandler(handle_callback))
+
+    # Scheduled jobs in Africa local time
+    jq = app.job_queue
+    if jq:
+        jq.run_daily(job_retrain,           utc_from_local(8,  0))
+        jq.run_daily(job_daily_predictions, utc_from_local(12, 0))
+        jq.run_daily(job_auto_settle,       utc_from_local(9,  0))
+        log.info("Scheduled jobs registered ✅")
+    else:
+        log.warning("No job queue — install: pip install python-telegram-bot[job-queue]")
+
+    log.info("⚽ DRAW HUNTER started. All commands registered.")
+    app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
     main()

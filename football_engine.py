@@ -590,11 +590,10 @@ def store_csv_matches(df: pd.DataFrame, league_code: str):
             except Exception:
                 pass
 
-            if not draw_odds: draw_odds = 3.20
             implied_draw_prob = round(1 / draw_odds, 4) if draw_odds and draw_odds > 1 else 0.30
 
             # ── Compute rolling features from running cache ───────────
-            def team_rolling(team):
+            def team_rolling(team, is_home_team):
                 hist = team_history_cache.get(team, [])
                 if not hist:
                     return {
@@ -629,14 +628,14 @@ def store_csv_matches(df: pd.DataFrame, league_code: str):
                     'last5_draws':         last5_draws,
                 }
 
-            hf = team_rolling(home_team)
-            af = team_rolling(away_team)
+            hf = team_rolling(home_team, True)
+            af = team_rolling(away_team, False)
 
             # H2H draw rate from DB
             h2h_dr, h2h_n = get_h2h_draw_rate(home_team, away_team)
 
             # Context
-            is_copa    = 1 if 'lib' in league_code or 'sud' in league_code else 0
+            is_copa    = 1 if 'libertadores' in league_code or 'sudamericana' in league_code else 0
             altitude   = 0.1  # CSV leagues mostly low altitude
             is_derby   = 0
             derby_pairs = [
@@ -726,7 +725,7 @@ def predict_draw_prob(features: dict) -> tuple:
     try:
         model     = joblib.load(f'{MODELS_DIR}/draw_model.pkl')
         scaler    = joblib.load(f'{MODELS_DIR}/draw_scaler.pkl')
-        feat_cols = FEATURE_COLUMNS # Standardized
+        feat_cols = joblib.load(f'{MODELS_DIR}/draw_features.pkl')
 
         X   = np.array([[float(features.get(c, 0) or 0) for c in feat_cols]])
         X_s = scaler.transform(X)
