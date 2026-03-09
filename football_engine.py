@@ -26,9 +26,16 @@ log = logging.getLogger(__name__)
 DB_PATH      = "draw_hunter.db"
 MODELS_DIR   = "models"
 MAX_CONF     = 88.0
-MIN_CONF_BET = 62.0
-MIN_EDGE_PCT = 5.0
-LOOKBACK     = 10
+MIN_CONF_BET  = 52.0    # minimum confidence to show any pick
+MIN_EDGE_PCT  = 3.0     # minimum edge to flag as VALUE
+LOOKBACK      = 10
+
+# Tier thresholds
+TIER_ELITE    = 10.0    # 🔥🔥 edge >= 10%
+TIER_STRONG   = 7.0     # 🔥   edge >= 7%
+TIER_VALUE    = 4.0     # ✅   edge >= 4%
+TIER_LEAN     = 2.0     # ⚠️   edge >= 2%  (show but no stake)
+TIER_INFO     = 0.0     # 📊   any positive edge (info only)
 ESPN_BASE    = "https://site.api.espn.com/apis/site/v2/sports/soccer"
 
 # ESPN League IDs for Soccer
@@ -914,12 +921,29 @@ def predict_match(fixture: dict, bankroll: float = 1000) -> dict:
     edge_pct     = round((draw_prob / 100) - implied_prob, 4) * 100
     has_value    = edge_pct >= MIN_EDGE_PCT and draw_prob >= MIN_CONF_BET
 
-    if edge_pct >= 10:             edge_label = "🔥 STRONG VALUE"
-    elif edge_pct >= 7:            edge_label = "✅ GOOD VALUE"
-    elif edge_pct >= MIN_EDGE_PCT: edge_label = "⚠️ LEAN VALUE"
-    else:                          edge_label = "❌ NO VALUE"
+    if edge_pct >= TIER_ELITE:
+        edge_label = "🔥🔥 ELITE VALUE"
+        has_value  = True
+    elif edge_pct >= TIER_STRONG:
+        edge_label = "🔥 STRONG VALUE"
+        has_value  = True
+    elif edge_pct >= TIER_VALUE:
+        edge_label = "✅ GOOD VALUE"
+        has_value  = True
+    elif edge_pct >= TIER_LEAN:
+        edge_label = "⚠️ LEAN VALUE"
+        has_value  = confidence >= 50.0   # lean picks only if decent confidence
+    elif edge_pct >= TIER_INFO:
+        edge_label = "📊 MARGINAL"
+        has_value  = False
+    else:
+        edge_label = "❌ NO VALUE"
+        has_value  = False
 
-    stake = kelly_stake(draw_prob, draw_odds, bankroll) if has_value else 0
+    # Stake — only on value picks with real confidence
+    stake = 0.0
+    if has_value and edge_pct >= TIER_VALUE and confidence >= MIN_CONF_BET:
+        stake = kelly_stake(draw_prob, draw_odds, bankroll)
 
     # Data quality note
     home_games = features.get('_home_games', 0)
@@ -1006,8 +1030,51 @@ def train_draw_model():
     joblib.dump(FEATURE_COLUMNS, f"{MODELS_DIR}/draw_features.pkl")
     return True, model
 
-def find_best_draws(preds: list) -> list:
-    return sorted([p for p in preds if p.get('has_value')], key=lambda x: x.get('edge_pct', 0), reverse=True)
+def find_best_draws(predictions: list) -> dict:
+    """
+    Rank predictions into tiers.
+    Returns dict with tier lists — not just a flat list.
+    """
+    elite   = []
+    strong  = []
+    value   = []
+    lean    = []
+    info    = []
+
+    for p in predictions:
+        ep = p.get('edge_pct', 0)
+        dp = p.get('draw_prob', 0)
+        cf = p.get('confidence', 0)
+
+        # Skip very low draw probability regardless of edge
+        if dp < 20:
+            continue
+
+        score = round(ep * (dp / 100) * (cf / 100), 4)
+        p['_score'] = score
+
+        if ep >= TIER_ELITE and cf >= 50:
+            elite.append(p)
+        elif ep >= TIER_STRONG and cf >= 50:
+            strong.append(p)
+        elif ep >= TIER_VALUE and cf >= 48:
+            value.append(p)
+        elif ep >= TIER_LEAN and cf >= 46:
+            lean.append(p)
+        elif ep >= TIER_INFO and dp >= 28:
+            info.append(p)
+
+    for tier in (elite, strong, value, lean, info):
+        tier.sort(key=lambda x: x.get('_score', 0), reverse=True)
+
+    return {
+        'elite':  elite,
+        'strong': strong,
+        'value':  value,
+        'lean':   lean,
+        'info':   info,
+        'all_value': elite + strong + value,
+    }
 
 def daily_retrain():
     init_db()

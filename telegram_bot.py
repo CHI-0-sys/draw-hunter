@@ -109,38 +109,98 @@ def fmt_prediction(p: dict, index: int = 1) -> str:
             f"Odds: {p.get('draw_odds','?')}"
         )
 
-def fmt_daily_report(all_preds: list, value_picks: list) -> str:
-    """Format a summary report of today's predictions."""
-    now_str = datetime.now().strftime('%b %d, %Y')
-    msg = f"⚽ DRAW HUNTER — {now_str}\n━━━━━━━━━━━━━━━━━━━━\n"
-    msg += f"📊 Analyzed : {len(all_preds)} matches\n"
-    msg += f"🎯 Value picks found: {len(value_picks)}\n\n"
+def fmt_daily_report(tiers: dict, total_analyzed: int) -> str:
+    """
+    Tiered daily report.
+    tiers: dict from find_best_draws()
+    """
+    elite  = tiers.get('elite', [])
+    strong = tiers.get('strong', [])
+    value  = tiers.get('value', [])
+    lean   = tiers.get('lean', [])
 
-    if not value_picks:
-        msg += "❌ No high-value draws found today.\n"
-    else:
-        msg += "🔥 *TOP VALUE DRAWS TODAY:*\n\n"
-        for i, p in enumerate(value_picks[:5], 1):
-            home = p.get('home_team', 'Home')
-            away = p.get('away_team', 'Away')
-            prob = p.get('draw_prob', 0)
-            edge = p.get('edge_pct', 0)
-            conf = p.get('confidence', 0)
-            odds = p.get('draw_odds', 0)
-            label = p.get('edge_label', '')
-            
-            msg += f"*{i}. {home} vs {away}*\n"
-            msg += f"   Draw: {prob}% | Edge: {edge:+.1f}% | Conf: {conf}%\n"
-            msg += f"   Odds: {odds} | {label}\n\n"
+    all_picks = elite + strong + value + lean
+    staking   = elite + strong + value  # picks with actual stake
 
-        # Best pick highlight
-        best = value_picks[0]
-        msg += "━━━━━━━━━━━━━━━━━━━━\n"
-        msg += f"🏆 *BEST PICK:* {best.get('home_team')} vs {best.get('away_team')}\n"
-        msg += f"   Edge: {best.get('edge_pct', 0):+.1f}% | Stake: ${best.get('stake', 0)}\n"
-    
-    msg += "━━━━━━━━━━━━━━━━━━━━\n⚠️ Always verify odds before betting."
-    return msg
+    if not all_picks:
+        return (
+            f"⚽ *DRAW HUNTER — {datetime.now().strftime('%b %d, %Y')}*\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"📊 {total_analyzed} matches analyzed\n"
+            f"❌ No draw edges found today\n\n"
+            f"Book odds too tight or model sees no edge.\n"
+            f"Come back tomorrow 💤"
+        )
+
+    lines = [
+        f"⚽ *DRAW HUNTER — {datetime.now().strftime('%b %d, %Y')}*",
+        f"━━━━━━━━━━━━━━━━━━━━",
+        f"📊 Analyzed : *{total_analyzed}* matches",
+        f"🎯 Flagged  : *{len(all_picks)}* draws "
+        f"({len(staking)} with stake)",
+        f"",
+    ]
+
+    # Elite tier
+    if elite:
+        lines.append(f"🔥🔥 *ELITE VALUE ({len(elite)}):*")
+        for p in elite[:4]:
+            lines += [
+                f"  ⚽ *{p['home_team']} vs {p['away_team']}*",
+                f"  {p.get('league_name','⚽')} — {p.get('time_local','TBD')}",
+                f"  Draw: {p['draw_prob']}% | Edge: {p['edge_pct']:+.1f}% | "
+                f"Odds: {p['draw_odds']} | Stake: *${p['stake']}*",
+                f"",
+            ]
+
+    # Strong tier
+    if strong:
+        lines.append(f"🔥 *STRONG VALUE ({len(strong)}):*")
+        for p in strong[:5]:
+            lines += [
+                f"  ⚽ *{p['home_team']} vs {p['away_team']}*",
+                f"  {p.get('league_name','⚽')} — {p.get('time_local','TBD')}",
+                f"  Draw: {p['draw_prob']}% | Edge: {p['edge_pct']:+.1f}% | "
+                f"Odds: {p['draw_odds']} | Stake: *${p['stake']}*",
+                f"",
+            ]
+
+    # Value tier
+    if value:
+        lines.append(f"✅ *GOOD VALUE ({len(value)}):*")
+        for p in value[:6]:
+            lines += [
+                f"  ⚽ {p['home_team']} vs {p['away_team']}",
+                f"  {p.get('league_name','⚽')} | "
+                f"Draw: {p['draw_prob']}% | Edge: {p['edge_pct']:+.1f}% | "
+                f"Stake: ${p['stake']}",
+                f"",
+            ]
+
+    # Lean tier (no stake, info only)
+    if lean:
+        lines.append(f"⚠️ *LEAN / WATCH ({len(lean)}) — no stake:*")
+        for p in lean[:5]:
+            lines.append(
+                f"  {p['home_team']} vs {p['away_team']} | "
+                f"Draw: {p['draw_prob']}% | Edge: {p['edge_pct']:+.1f}%"
+            )
+        lines.append("")
+
+    # Best pick summary
+    best = (elite + strong + value)[0] if (elite + strong + value) else None
+    if best:
+        lines += [
+            f"━━━━━━━━━━━━━━━━━━━━",
+            f"🏆 *BEST PICK: {best['home_team']} vs {best['away_team']}*",
+            f"   {best.get('league_name','')} | "
+            f"Edge: {best['edge_pct']:+.1f}% | "
+            f"Stake: ${best['stake']}",
+            f"━━━━━━━━━━━━━━━━━━━━",
+            f"⚠️ Verify all odds before betting",
+        ]
+
+    return "\n".join(lines)
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = """👋 Welcome to Draw Hunter Bot V2!
@@ -156,6 +216,7 @@ Leagues Covered:
 
 Commands:
 /today - Today's value picks
+/draws - Top matches by draw prob
 /match [home] vs [away] - Predict specific match
 /record - All-time stats
 /status - Model performance
@@ -206,44 +267,59 @@ async def cmd_today(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        value_draws = engine.find_best_draws(predictions)
+        tiers = engine.find_best_draws(predictions)
 
         # Send summary
         await update.message.reply_text(
-            fmt_daily_report(predictions, value_draws),
+            fmt_daily_report(tiers, len(predictions)),
             parse_mode='Markdown'
         )
 
-        # Send detailed card for top value draws
-        for p in value_draws[:4]:
-            await asyncio.sleep(1)
-            kb = [[InlineKeyboardButton(
-                "📋 Log this pick",
-                callback_data=f"log_{p['fixture_id']}"
-            )]]
+        # Send detailed cards for top picks only (elite + strong)
+        top_detail = tiers.get('elite', []) + tiers.get('strong', [])
+        top_detail = top_detail[:5]
+        
+        if top_detail:
             await update.message.reply_text(
-                fmt_prediction(p),
-                parse_mode='Markdown',
-                reply_markup=InlineKeyboardMarkup(kb)
+                f"🔍 *Detailed analysis — top {len(top_detail)} picks:*",
+                parse_mode='Markdown'
             )
+            for p in top_detail:
+                await asyncio.sleep(0.8)
+                kb = [[InlineKeyboardButton(
+                    "📋 Log this pick",
+                    callback_data=f"log_{p['fixture_id']}"
+                )]]
+                await update.message.reply_text(
+                    fmt_prediction(p),
+                    parse_mode='Markdown',
+                    reply_markup=InlineKeyboardMarkup(kb)
+                )
 
         # Cache for logging
         ctx.bot_data['today_predictions'] = {
             p['fixture_id']: p for p in predictions
         }
 
-        # If no value draws, show top 3 anyway for info
-        if not value_draws and predictions:
-            await update.message.reply_text(
-                "📊 *Top matches by draw probability:*",
-                parse_mode='Markdown'
-            )
-            top3 = sorted(predictions, key=lambda x: x.get('draw_prob', 0), reverse=True)[:3]
-            for p in top3:
-                await asyncio.sleep(1)
+        all_shown = tiers.get('all_value', []) + tiers.get('lean', [])
+        # If truly nothing at all
+        if not all_shown and predictions:
+            top5 = sorted(
+                [p for p in predictions if p.get('draw_prob', 0) >= 25],
+                key=lambda x: x.get('draw_prob', 0),
+                reverse=True
+            )[:5]
+            if top5:
                 await update.message.reply_text(
-                    fmt_prediction(p), parse_mode='Markdown'
+                    f"📊 *Top {len(top5)} by draw probability "
+                    f"(no edge found):*",
+                    parse_mode='Markdown'
                 )
+                for p in top5:
+                    await asyncio.sleep(0.8)
+                    await update.message.reply_text(
+                        fmt_prediction(p), parse_mode='Markdown'
+                    )
 
     except Exception as e:
         log.error(f"cmd_today error: {e}", exc_info=True)
@@ -539,14 +615,109 @@ async def job_daily_predictions(context: ContextTypes.DEFAULT_TYPE):
     for f in fixtures:
         p = engine.predict_match(f, bankroll=BANKROLL)
         preds.append(p)
-    best = engine.find_best_draws(preds)
+    tiers = engine.find_best_draws(preds)
     if CHAT_ID:
-        report = fmt_daily_report(preds, best)
+        report = fmt_daily_report(tiers, len(preds))
         await context.bot.send_message(chat_id=CHAT_ID, text=report, parse_mode='Markdown')
 
 async def job_auto_settle(context: ContextTypes.DEFAULT_TYPE):
     # Placeholder for auto-settling logic
     log.info("Auto-settle job triggered")
+
+async def cmd_draws(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """
+    Show top 20 matches by raw draw probability — no edge filter.
+    Useful when odds not available or model just trained.
+    Usage: /draws
+           /draws 30    (show top 30)
+           /draws clay  (filter by league keyword)
+    """
+    limit  = 20
+    filter_kw = None
+
+    if ctx.args:
+        arg = ctx.args[0]
+        if arg.isdigit():
+            limit = min(int(arg), 50)
+        else:
+            filter_kw = arg.lower()
+
+    msg = await update.message.reply_text(
+        f"⚽ Fetching top draw candidates..."
+    )
+    try:
+        fixtures = engine.get_todays_fixtures(TIMEZONE)
+
+        if filter_kw:
+            fixtures = [
+                f for f in fixtures
+                if filter_kw in f.get('league','').lower() or
+                   filter_kw in f.get('league_name','').lower() or
+                   filter_kw in f.get('country','').lower()
+            ]
+
+        if not fixtures:
+            await msg.edit_text("No fixtures found. Try /today.")
+            return
+
+        await msg.edit_text(
+            f"⚽ Predicting {len(fixtures)} fixtures...",
+            parse_mode='Markdown'
+        )
+
+        predictions = []
+        for fixture in fixtures:
+            try:
+                pred = engine.predict_match(fixture, BANKROLL)
+                predictions.append(pred)
+            except Exception:
+                pass
+
+        # Sort purely by draw_prob — ignore edge
+        predictions.sort(key=lambda x: x.get('draw_prob', 0), reverse=True)
+        top = predictions[:limit]
+
+        if not top:
+            await update.message.reply_text("No predictions generated.")
+            return
+
+        lines = [
+            f"⚽ *TOP {len(top)} DRAW CANDIDATES*",
+            f"📊 {len(predictions)} matches analyzed",
+            f"Sorted by draw probability (no edge filter)",
+            f"━━━━━━━━━━━━━━━━━━━━",
+            f"",
+        ]
+
+        for i, p in enumerate(top, 1):
+            edge_str = f"Edge: {p['edge_pct']:+.1f}%" if p.get('draw_odds') else "No odds"
+            tier_e   = (
+                "🔥🔥" if p['edge_pct'] >= engine.TIER_ELITE else
+                "🔥"   if p['edge_pct'] >= engine.TIER_STRONG else
+                "✅"   if p['edge_pct'] >= engine.TIER_VALUE else
+                "⚠️"   if p['edge_pct'] >= engine.TIER_LEAN else
+                "📊"
+            )
+            lines.append(
+                f"{i:2}. {tier_e} *{p['home_team']} vs {p['away_team']}*\n"
+                f"    {p.get('league_name','⚽')} — {p.get('time_local','TBD')}\n"
+                f"    Draw: *{p['draw_prob']}%* | "
+                f"{edge_str} | Odds: {p.get('draw_odds','?')}\n"
+            )
+
+        lines += [
+            f"━━━━━━━━━━━━━━━━━━━━",
+            f"🔥🔥 ≥10% edge | 🔥 ≥7% | ✅ ≥4% | ⚠️ ≥2% | 📊 marginal",
+            f"Use /today for full value analysis",
+        ]
+
+        await update.message.reply_text(
+            "\n".join(lines), parse_mode='Markdown'
+        )
+
+    except Exception as e:
+        log.error(f"cmd_draws: {e}", exc_info=True)
+        await msg.edit_text(f"❌ Error: {e}")
 
 def main():
     if not TELEGRAM_TOKEN:
@@ -561,7 +732,8 @@ def main():
     app.add_handler(CommandHandler("start",    cmd_start))
     app.add_handler(CommandHandler("today",    cmd_today))
     app.add_handler(CommandHandler("match",    cmd_match))
-    app.add_handler(CommandHandler("odds",     cmd_odds))
+    app.add_handler(CommandHandler("today",      cmd_today))
+    app.add_handler(CommandHandler("draws",      cmd_draws))
     app.add_handler(CommandHandler("record",   cmd_record))
     app.add_handler(CommandHandler("pending",  cmd_pending))
     app.add_handler(CommandHandler("settle",   cmd_settle))
